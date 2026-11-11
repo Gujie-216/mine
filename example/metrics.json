@@ -1,0 +1,8 @@
+{
+  "seed": 7,
+  "frames": 161,
+  "odom_rmse_m": 0.6546546871925045,
+  "slam_rmse_m": 0.10350244008365456,
+  "path_found": true,
+  "path_length_m": 11.85
+}
