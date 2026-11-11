@@ -1,0 +1,260 @@
+diff --git a/Examples/Monocular/mono_tum.cc b/Examples/Monocular/mono_tum.cc
+index 0e7d922..f52a1f6 100644
+--- a/Examples/Monocular/mono_tum.cc
++++ b/Examples/Monocular/mono_tum.cc
+@@ -47,7 +47,7 @@ int main(int argc, char **argv)
+     int nImages = vstrImageFilenames.size();
+ 
+     // Create SLAM system. It initializes all system threads and gets ready to process frames.
+-    ORB_SLAM3::System SLAM(argv[1],argv[2],ORB_SLAM3::System::MONOCULAR,true);
++    ORB_SLAM3::System SLAM(argv[1],argv[2],ORB_SLAM3::System::MONOCULAR,false);
+     float imageScale = SLAM.GetImageScale();
+ 
+     // Vector for tracking time statistics
+diff --git a/include/ORBextractor.h b/include/ORBextractor.h
+index bb7aace..f549bed 100644
+--- a/include/ORBextractor.h
++++ b/include/ORBextractor.h
+@@ -51,6 +51,14 @@ public:
+ 
+     ~ORBextractor(){}
+ 
++    void SetBudget(int percent, bool selective, unsigned phase) {
++        budgetPercent = percent;
++        selectiveRetries = selective;
++        retryPhase = phase;
++    }
++    int retryCalls = 0;
++    int emptyCells = 0;
++
+     // Compute the ORB features and descriptors on an image.
+     // ORB are dispersed on the image using an octree.
+     // Mask is ignored in the current implementation.
+@@ -93,6 +101,9 @@ protected:
+     std::vector<cv::Point> pattern;
+ 
+     int nfeatures;
++    int budgetPercent = 100;
++    bool selectiveRetries = false;
++    unsigned retryPhase = 0;
+     double scaleFactor;
+     int nlevels;
+     int iniThFAST;
+diff --git a/include/Tracking.h b/include/Tracking.h
+index 863c98e..35dd320 100644
+--- a/include/Tracking.h
++++ b/include/Tracking.h
+@@ -40,6 +40,8 @@
+ #include "GeometricCamera.h"
+ 
+ #include <mutex>
++#include <fstream>
++#include <deque>
+ #include <unordered_set>
+ 
+ namespace ORB_SLAM3
+@@ -314,6 +316,9 @@ protected:
+ 
+     //Current matches in frame
+     int mnMatchesInliers;
++    int featurePercent = 100, stableFrames = 0, cooldownFrames = 0;
++    std::deque<double> recentFrameMs;
++    std::ofstream frameLog;
+ 
+     //Last Frame, KeyFrame and Relocalisation Info
+     KeyFrame* mpLastKeyFrame;
+diff --git a/src/ORBextractor.cc b/src/ORBextractor.cc
+index 970b7cc..c752ddd 100644
+--- a/src/ORBextractor.cc
++++ b/src/ORBextractor.cc
+@@ -57,6 +57,7 @@
+ #include <opencv2/features2d/features2d.hpp>
+ #include <opencv2/imgproc/imgproc.hpp>
+ #include <vector>
++#include <algorithm>
+ #include <iostream>
+ 
+ #include "ORBextractor.h"
+@@ -783,6 +784,8 @@ namespace ORB_SLAM3
+         allKeypoints.resize(nlevels);
+ 
+         const float W = 35;
++        retryCalls = 0;
++        emptyCells = 0;
+ 
+         for (int level = 0; level < nlevels; ++level)
+         {
+@@ -802,6 +805,10 @@ namespace ORB_SLAM3
+             const int wCell = ceil(width/nCols);
+             const int hCell = ceil(height/nRows);
+ 
++            struct Retry { cv::Rect roi; int xOffset, yOffset, region; };
++            vector<Retry> retries;
++            int support[16] = {};
++
+             for(int i=0; i<nRows; i++)
+             {
+                 const float iniY =minBorderY+i*hCell;
+@@ -842,6 +849,14 @@ namespace ORB_SLAM3
+ 
+                     if(vKeysCell.empty())
+                     {
++                        ++emptyCells;
++                        if(selectiveRetries) {
++                            int region = 4*(4*i/nRows) + 4*j/nCols;
++                            retries.push_back({cv::Rect(iniX, iniY, maxX-iniX, maxY-iniY),
++                                               j*wCell, i*hCell, region});
++                            continue;
++                        }
++                        ++retryCalls;
+                         FAST(mvImagePyramid[level].rowRange(iniY,maxY).colRange(iniX,maxX),
+                              vKeysCell,minThFAST,true);
+                         /*if(bRight && j <= 13){
+@@ -860,6 +875,8 @@ namespace ORB_SLAM3
+ 
+                     if(!vKeysCell.empty())
+                     {
++                        if(selectiveRetries)
++                            support[4*(4*i/nRows) + 4*j/nCols] += vKeysCell.size();
+                         for(vector<cv::KeyPoint>::iterator vit=vKeysCell.begin(); vit!=vKeysCell.end();vit++)
+                         {
+                             (*vit).pt.x+=j*wCell;
+@@ -872,10 +889,28 @@ namespace ORB_SLAM3
+             }
+ 
+             vector<KeyPoint> & keypoints = allKeypoints[level];
++            if(!retries.empty()) {
++                std::rotate(retries.begin(), retries.begin() + retryPhase % retries.size(), retries.end());
++                std::stable_sort(retries.begin(), retries.end(), [&](const Retry& a, const Retry& b) {
++                    return support[a.region] < support[b.region];
++                });
++                for(size_t k = 0; k < (retries.size()+1)/2; ++k) {
++                    const Retry& cell = retries[k];
++                    vector<KeyPoint> keys;
++                    FAST(mvImagePyramid[level](cell.roi), keys, minThFAST, true);
++                    ++retryCalls;
++                    for(auto& key : keys) {
++                        key.pt.x += cell.xOffset;
++                        key.pt.y += cell.yOffset;
++                        vToDistributeKeys.push_back(key);
++                    }
++                }
++            }
+             keypoints.reserve(nfeatures);
+ 
+             keypoints = DistributeOctTree(vToDistributeKeys, minBorderX, maxBorderX,
+-                                          minBorderY, maxBorderY,mnFeaturesPerLevel[level], level);
++                                          minBorderY, maxBorderY, budgetPercent == 100 ? mnFeaturesPerLevel[level]
++                                          : std::max(1, cvRound(mnFeaturesPerLevel[level]*budgetPercent/100.0)), level);
+ 
+             const int scaledPatchSize = PATCH_SIZE*mvScaleFactor[level];
+ 
+diff --git a/src/Tracking.cc b/src/Tracking.cc
+index 5191451..bb3fa79 100644
+--- a/src/Tracking.cc
++++ b/src/Tracking.cc
+@@ -18,6 +18,10 @@
+ 
+ 
+ #include "Tracking.h"
++#include <algorithm>
++#include <cstdlib>
++#include <ctime>
++#include <iomanip>
+ 
+ #include "ORBmatcher.h"
+ #include "FrameDrawer.h"
+@@ -1565,6 +1569,35 @@ Sophus::SE3f Tracking::GrabImageRGBD(const cv::Mat &imRGB,const cv::Mat &imD, co
+ 
+ Sophus::SE3f Tracking::GrabImageMonocular(const cv::Mat &im, const double &timestamp, string filename)
+ {
++    using Clock = std::chrono::steady_clock;
++    const auto begin = Clock::now();
++    static const std::string mode = std::getenv("ORB_BUDGET_MODE") ? std::getenv("ORB_BUDGET_MODE") : "stock";
++    static const bool adaptive = mode == "A" || mode == "AB";
++    static const bool retries = mode == "B" || mode == "AB";
++    static const int fixedPercent = [] {
++        if(mode != "fixed") {
++            if(mode != "stock" && mode != "A" && mode != "B" && mode != "AB")
++                throw std::invalid_argument("Unknown ORB_BUDGET_MODE");
++            return 100;
++        }
++        const char* value = std::getenv("ORB_FIXED_PERCENT");
++        const int percent = value ? std::stoi(value) : 80;
++        if(percent < 1 || percent > 100) throw std::invalid_argument("ORB_FIXED_PERCENT must be 1..100");
++        return percent;
++    }();
++    static const char* logPath = std::getenv("ORB_FRAME_LOG");
++    const bool mono = mSensor == System::MONOCULAR;
++    const bool init = mono && (mState == NO_IMAGES_YET || mState == NOT_INITIALIZED ||
++                               (lastID - initID) < mMaxFrames);
++    const bool recovering = init || mState != OK || lastID < mnLastRelocFrameId + 10;
++    if(recovering) {
++        featurePercent = 100;
++        stableFrames = cooldownFrames = 0;
++        recentFrameMs.clear();
++    }
++    const int usedBudget = init ? 100 : (adaptive ? featurePercent : fixedPercent);
++    if(mono)
++        mpORBextractorLeft->SetBudget(usedBudget, retries && !recovering && stableFrames >= 3, lastID);
+     mImGray = im;
+     if(mImGray.channels()==3)
+     {
+@@ -1611,6 +1644,57 @@ Sophus::SE3f Tracking::GrabImageMonocular(const cv::Mat &im, const double &times
+     lastID = mCurrentFrame.mnId;
+     Track();
+ 
++    if(mono && (adaptive || retries || logPath)) {
++        int bins[16] = {}, inliers = 0;
++        for(size_t i = 0; i < mCurrentFrame.mvpMapPoints.size(); ++i) {
++            if(!mCurrentFrame.mvpMapPoints[i] || mCurrentFrame.mvbOutlier[i]) continue;
++            const auto& pt = mCurrentFrame.mvKeys[i].pt;
++            int x = std::min(3, std::max(0, int(4*pt.x/im.cols)));
++            int y = std::min(3, std::max(0, int(4*pt.y/im.rows)));
++            ++bins[4*y+x];
++            ++inliers;
++        }
++        const int covered = std::count_if(bins, bins+16, [](int n) { return n >= 2; });
++        const auto end = Clock::now();
++        double elapsed = std::chrono::duration<double,std::milli>(end-begin).count();
++        recentFrameMs.push_back(elapsed);
++        if(recentFrameMs.size() > 5) recentFrameMs.pop_front();
++        if(mState != OK || init || inliers < 50 || covered < 6) {
++            featurePercent = 100;
++            stableFrames = cooldownFrames = 0;
++        } else {
++            stableFrames = inliers >= 80 && covered >= 10 ? stableFrames+1 : 0;
++            if(cooldownFrames > 0) --cooldownFrames;
++            if(adaptive && stableFrames >= 3 && cooldownFrames == 0 && recentFrameMs.size() == 5) {
++                auto times = recentFrameMs;
++                std::sort(times.begin(), times.end());
++                if(times[2] > 900.0/std::max(1, mMaxFrames)) {
++                    featurePercent = std::max(60, featurePercent-20);
++                    cooldownFrames = 5;
++                }
++            }
++        }
++        if(logPath) {
++            if(!frameLog.is_open()) {
++                frameLog.open(logPath);
++                if(!frameLog) throw std::runtime_error("Cannot open ORB_FRAME_LOG");
++                frameLog << "stamp,state,map,valid,init,percent,features,inliers,covered,empty,retries,frame_ms,wall_s,cpu_s,x,y,z,qx,qy,qz,qw\n";
++            }
++            const bool valid = mState == OK && mCurrentFrame.HasPose();
++            const auto pose = mCurrentFrame.GetPose().inverse();
++            const auto t = pose.translation();
++            const auto q = pose.unit_quaternion();
++            auto* ext = init ? mpIniORBextractor : mpORBextractorLeft;
++            frameLog << std::setprecision(16) << timestamp << ',' << mState << ',' << mpAtlas->GetCurrentMap()->GetId()
++                     << ',' << valid << ',' << init << ',' << usedBudget << ',' << mCurrentFrame.N << ',' << inliers
++                     << ',' << covered << ',' << ext->emptyCells << ',' << ext->retryCalls << ',' << elapsed << ','
++                     << std::chrono::duration<double>(end.time_since_epoch()).count() << ',' << double(std::clock())/CLOCKS_PER_SEC
++                     << ',' << t.x() << ',' << t.y() << ',' << t.z() << ',' << q.x() << ',' << q.y() << ','
++                     << q.z() << ',' << q.w() << '\n';
++            frameLog.flush();
++        }
++    }
++
+     return mCurrentFrame.GetPose();
+ }
+ 
