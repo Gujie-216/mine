@@ -18,10 +18,19 @@ def cell(x, y):
     return math.floor(x / RES), math.floor(y / RES)
 
 
-def simulate(seed):
+ROOM = (0, 0, 12, 9)
+SCENES = {
+    "open": (),
+    "furnished": ((4.5, 3.7, 7, 5.5), (8, 5.9, 9, 6.4)),
+    "partitioned": ((3.8, 3.0, 4.2, 5.8), (6.0, 2.7, 8.6, 3.1),
+                    (6.0, 5.8, 8.5, 6.2)),
+}
+
+
+def simulate(seed, scene="furnished"):
     """Generate local-frame odometry, ranges and a separate evaluation pose."""
     rng = random.Random(seed)
-    boxes = [(0, 0, 12, 9), (4.5, 3.7, 7, 5.5), (8, 6.8, 9, 7.4)]
+    boxes = [ROOM, *SCENES[scene]]
     walls = []
     for left, bottom, right, top in boxes:
         walls.extend([(0, left, bottom, top), (0, right, bottom, top),
@@ -121,10 +130,9 @@ def plan(grid, start, goal):
     return []
 
 
-def run(seed, out):
-    out.mkdir(parents=True, exist_ok=True)
+def replay(seed, scene):
     grid, rows = defaultdict(int), []
-    for i, (motion, ranges, truth) in enumerate(simulate(seed)):
+    for i, (motion, ranges, truth) in enumerate(simulate(seed, scene)):
         if i == 0:
             # Common initial reference for evaluation.
             odom = estimate = truth
@@ -133,6 +141,12 @@ def run(seed, out):
             estimate = match(grid, advance(estimate, motion), ranges)
         integrate(grid, estimate, ranges)
         rows.append((i, *truth, *odom, *estimate))
+    return grid, rows
+
+
+def run(seed, out, scene="furnished"):
+    out.mkdir(parents=True, exist_ok=True)
+    grid, rows = replay(seed, scene)
     with (out/'trajectory.csv').open('w', newline='') as f:
         writer = csv.writer(f)
         writer.writerow(['frame']+[f'{kind}_{axis}' for kind in ('truth','odom','slam')
@@ -141,7 +155,7 @@ def run(seed, out):
     def rmse(k):
         return math.sqrt(sum((r[k]-r[1])**2+(r[k+1]-r[2])**2 for r in rows)/len(rows))
     path = plan(grid, cell(*rows[0][7:9]), cell(*rows[80][7:9]))
-    metrics = dict(seed=seed, frames=len(rows), odom_rmse_m=rmse(4), slam_rmse_m=rmse(7),
+    metrics = dict(scene=scene, seed=seed, frames=len(rows), odom_rmse_m=rmse(4), slam_rmse_m=rmse(7),
                    path_found=bool(path), path_length_m=(len(path)-1)*RES if path else None)
     (out/'metrics.json').write_text(json.dumps(metrics, indent=2), encoding='utf-8')
     with (out/'map.svg').open('w', encoding='utf-8') as f:
@@ -162,6 +176,7 @@ def run(seed, out):
 if __name__ == '__main__':
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--seed', type=int, default=7)
+    parser.add_argument('--scene', choices=SCENES, default="furnished")
     parser.add_argument('--out', type=Path, default=Path('results'))
     args = parser.parse_args()
-    run(args.seed, args.out)
+    run(args.seed, args.out, args.scene)

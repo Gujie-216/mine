@@ -1,8 +1,9 @@
 {
+  "scene": "furnished",
   "seed": 7,
   "frames": 161,
-  "odom_rmse_m": 0.6546546871925045,
-  "slam_rmse_m": 0.10350244008365456,
+  "odom_rmse_m": 0.7954567517193426,
+  "slam_rmse_m": 0.12063641219998325,
   "path_found": true,
   "path_length_m": 11.85
 }
